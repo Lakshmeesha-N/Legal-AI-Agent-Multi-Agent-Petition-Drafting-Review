@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>DOCX.js Preview Sandbox</title>
+  <script src="/docx.js"></script>
+  <script>
+    // Save the docx generator before docx-preview overwrites window.docx
+    window.docxGenerator = window.docx;
+  </script>
+  <script src="/jszip.min.js"></script>
+  <script src="/docx-preview.min.js"></script>
+  <style>
+    body {
+      background-color: #0b0c10;
+      color: #e2e8f0;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      justify-content: center;
+      min-height: 100vh;
+      box-sizing: border-box;
+    }
+
+    .page-container {
+      width: 100%;
+      max-width: 800px;
+    }
+
+    /* Style the docx-preview wrapper if needed */
+    .docx-wrapper {
+      background: transparent !important;
+      padding: 0 !important;
+      width: 100% !important;
+    }
+
+    /* Force the document to fill the width */
+    .docx {
+      width: 100% !important;
+      min-height: 800px !important;
+      padding: 40px !important;
+      background: white !important;
+      color: black !important;
+      box-sizing: border-box !important;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+
+    .error-container {
+      background-color: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 8px;
+      padding: 20px;
+      color: #f87171;
+      width: 100%;
+      max-width: 600px;
+      margin: auto;
+      font-family: monospace;
+      white-space: pre-wrap;
+    }
+
+    .loading {
+      color: #94a3b8;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="app" class="page-container">
+    <div class="loading">Waiting for document code...</div>
+  </div>
+
+  <script>
+    // Create the customized wrappers for DOCX.js to capture and parse structure
+    const originalDocx = window.docxGenerator;
+    const docxPreview = window.docx;
+    let currentDocInstance = null;
+
+    // We stub global module requirements so code running with require() works
+    window.require = function (mod) {
+      if (mod === "docx") return originalDocx;
+      return {};
+    };
+
+
+
+    // Listen for parent messages
+    window.addEventListener("message", async (event) => {
+      const { type, code, action } = event.data;
+
+      if (type === "RENDER_DOC") {
+        renderDocument(code);
+      } else if (type === "REQUEST_DOWNLOAD") {
+        generateAndSendBlob(code);
+      }
+    });
+
+    // Notify parent sandbox is ready
+    window.parent.postMessage({ type: "SANDBOX_READY" }, "*");
+
+    function sanitizeDocument(doc) {
+      if (!doc) return;
+      
+      function sanitizeElement(el) {
+        if (!el || typeof el !== 'object') return;
+        
+        if (Array.isArray(el.children)) {
+          el.children = el.children.filter(c => c !== null && c !== undefined);
+          el.children.forEach(sanitizeElement);
+        }
+        
+        for (const key in el) {
+          if (el[key] && typeof el[key] === 'object' && key !== 'children') {
+            sanitizeElement(el[key]);
+          }
+        }
+      }
+
+      if (Array.isArray(doc.sections)) {
+        doc.sections.forEach(section => {
+          if (Array.isArray(section.children)) {
+            section.children = section.children.filter(c => c !== null && c !== undefined);
+            section.children.forEach(sanitizeElement);
+          }
+        });
+      }
+    }
+
+    async function renderDocument(rawCode) {
+      const container = document.getElementById("app");
+      container.innerHTML = '<div class="loading">Compiling and rendering document...</div>';
+
+      try {
+        currentDocInstance = null;
+
+        // Clean up imports and exports
+        let cleaned = rawCode
+          .replace(/import\s+[\s\S]*?\s+from\s+['"].*?['"];?/g, "") // Remove imports
+          .replace(/export\s+default\s+/g, "") // Remove export default
+          .replace(/export\s+function/g, "function") // Make export function local
+          .replace(/const\s+docx\s*=\s*require\s*\(.*\);?/g, ""); // Remove require line
+
+        // Create compiler function injection
+        const keys = Object.keys(originalDocx).filter(k => /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(k));
+        const compileFn = new Function("docx", "require", `
+          const { ${keys.join(", ")} } = docx;
+          ${cleaned}
+          if (typeof buildDocument === 'function') {
+            return buildDocument;
+          } else {
+            throw new Error("Function 'buildDocument' not found in document code.");
+          }
+        `);
+
+        // Execute compiler to extract buildDocument function
+        const buildDocument = compileFn(originalDocx, window.require);
+        if (typeof buildDocument !== 'function') {
+          throw new Error("Function 'buildDocument' not found in document code.");
+        }
+
+        // Build document to trigger instance constructor
+        const doc = buildDocument(originalDocx);
+        if (!doc && !currentDocInstance) {
+          throw new Error("Document object is undefined. Ensure buildDocument returns a Document instance.");
+        }
+
+        const targetDoc = doc || currentDocInstance;
+        sanitizeDocument(targetDoc);
+
+        // Generate Blob via Packer
+        const blob = await originalDocx.Packer.toBlob(targetDoc);
+
+        // Render preview
+        container.innerHTML = "";
+        await docxPreview.renderAsync(blob, container, null, {
+          className: "docx",
+          inWrapper: true,
+          ignoreWidth: true,
+          ignoreHeight: true,
+          ignoreFonts: false,
+          breakPages: true,
+          useBase64URL: false,
+          renderHeaders: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          renderEndnotes: true,
+        });
+
+        // Notify parent layout page counts
+        const pageSheets = container.querySelectorAll("section");
+        window.parent.postMessage({
+          type: "RENDER_COMPLETE",
+          pageCount: pageSheets.length > 0 ? pageSheets.length : 1
+        }, "*");
+
+      } catch (err) {
+        container.innerHTML = `
+          <div class="error-container">
+            <h3>Compilation / Rendering Error</h3>
+            <div>${escapeHtml(err.message)}</div>
+          </div>
+        `;
+        window.parent.postMessage({ type: "RENDER_ERROR", error: err.message }, "*");
+      }
+    }
+
+    async function generateAndSendBlob(rawCode) {
+      try {
+        currentDocInstance = null;
+
+        let cleaned = rawCode
+          .replace(/import\s+[\s\S]*?\s+from\s+['"].*?['"];?/g, "")
+          .replace(/export\s+default\s+/g, "")
+          .replace(/export\s+function/g, "function")
+          .replace(/const\s+docx\s*=\s*require\s*\(.*\);?/g, "");
+
+        const keys = Object.keys(originalDocx).filter(k => /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(k));
+        const compileFn = new Function("docx", "require", `
+          const { ${keys.join(", ")} } = docx;
+          ${cleaned}
+          return buildDocument;
+        `);
+
+        // Rebuild using the real raw docx package objects for Packer compilation
+        const buildDocument = compileFn(originalDocx, window.require);
+        if (typeof buildDocument !== 'function') {
+          throw new Error("Function 'buildDocument' not found in document code.");
+        }
+        const doc = buildDocument(originalDocx);
+        if (!doc && !currentDocInstance) {
+          throw new Error("Document object is undefined. Ensure buildDocument returns a Document instance.");
+        }
+
+        const targetDoc = doc || currentDocInstance;
+        sanitizeDocument(targetDoc);
+
+        // Generate Blob
+        const blob = await originalDocx.Packer.toBlob(targetDoc);
+
+        // Send blob arrayBuffer back to parent
+        const arrayBuffer = await blob.arrayBuffer();
+        window.parent.postMessage({
+          type: "DOWNLOAD_READY",
+          arrayBuffer: arrayBuffer,
+          mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        }, "*", [arrayBuffer]);
+      } catch (err) {
+        window.parent.postMessage({ type: "DOWNLOAD_ERROR", error: err.message }, "*");
+      }
+    }
+
+    function escapeHtml(unsafe) {
+      return unsafe
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+  </script>
+</body>
+
+</html>
