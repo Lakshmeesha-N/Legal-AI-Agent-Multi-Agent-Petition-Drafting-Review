@@ -20,6 +20,10 @@
 - [API Surface](#api-surface)
 - [Security & Auth](#security--auth)
 - [Token Tracking & Usage Limits](#token-tracking--usage-limits)
+- [Frontend Application](#frontend-application)
+  - [Frontend Tech Stack](#frontend-tech-stack)
+  - [Workspace Experience](#workspace-experience)
+  - [Frontend–Backend Integration](#frontendbackend-integration)
 - [Project Structure](#project-structure)
 
 ---
@@ -272,6 +276,99 @@ This enables a **single API call** to advance the entire intake-to-generation pi
 
 ---
 
+## Frontend Application
+
+> **Opandz AI Workspace** (`opandz_frontend/`) — a production-grade Next.js workspace where lawyers organize template vaults, run conversational case intake, preview court-ready documents live, and refine them with AI-powered edits.
+
+Live at **opandzai.web.app** (Firebase Hosting, site `opandzai`). The backend remains the system of record; the frontend is a secure, authenticated client over HTTPS + Bearer Token.
+
+### Frontend Tech Stack
+
+| Layer | Technology |
+|---|---|
+| **Framework** | Next.js 16 (App Router), React 19, TypeScript |
+| **Styling / UI** | Tailwind CSS 4, shadcn/ui, class-variance-authority, lucide-react |
+| **State / Data** | @tanstack/react-query (server state), React Context (auth/session) |
+| **Auth** | Firebase Authentication (Google + Email/Password), ID-token per request |
+| **Document Rendering** | `docx` (docxjs) + sandboxed `iframe` preview (`public/sandbox.html`) |
+| **Layout** | react-resizable-panels (intake chat + preview split views) |
+| **Hosting** | Firebase Hosting (framework-aware, `firebase.json` → site `opandzai`) |
+| **Backend Contract** | REST via `NEXT_PUBLIC_API_URL` (`src/lib/api.ts`), XHR uploads with progress, `pollJob` for async agent jobs |
+
+### Workspace Experience
+
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Vaults    │────▶│  Blueprint   │────▶│    Case      │────▶│   Document   │
+│  Explorer   │     │    Setup     │     │   Intake     │     │  Edit + DL   │
+└─────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+ Browse template    Upload PDF/DOCX      Chat + attach        Live DOCX preview
+ vaults & history   → async setup job    evidence → progress  AI edits, Accept/
+                                             → auto-generate   Reject, Download
+```
+
+| Surface | What the lawyer gets |
+|---|---|
+| **Authenticated Workspace** | Dark, firm-grade UI with Google + Email auth, persistent Firebase session, mock-sign-in for local dev |
+| **Vaults Explorer** | Browse secure template vaults, drill into blueprints, start intake per blueprint |
+| **Blueprint Setup Modal** | Upload DOCX/PDF (≤ 20 MB) with progress bar → async Setup Agent job → polling → vault refresh |
+| **Case Intake Chat** | Conversational evidence gathering with PDF/DOCX/image attachments, completion % bar, auto-transition to generation |
+| **Live Document Preview** | Sandboxed iframe renders compiled `generated_docxjs_code` page-by-page with page selector |
+| **AI Document Editor** | Instruction-based edits (“make it more professional”), attachment-aware, unsaved-edits guard, Accept saves to Firestore / Reject discards |
+| **One-click DOCX Export** | `REQUEST_DOWNLOAD` → sandbox compiles `.docx` blob → browser download |
+| **History** | Per-lawyer generated-document list, one-click reopen into the editor |
+| **Plan Awareness** | Premium upgrade modal on `403` (token/page limits), Free vs Premium messaging consistent with backend tiers |
+
+### Frontend–Backend Integration
+
+```mermaid
+sequenceDiagram
+    participant UI as Next.js Workspace
+    participant API as FastAPI Backend
+    participant Q as Redis Queue + Worker
+    participant Agents as LangGraph Agents
+
+    UI->>API: POST /agents/setup/ (FormData: vault, template, file) + Bearer ID-token
+    API->>Q: Enqueue setup job
+    UI->>API: GET /agents/setup/status/{job_id} (pollJob)
+    Q->>Agents: Setup Agent → blueprint in Firestore
+
+    UI->>API: POST /agents/intake/ (session_id, template_id, message, files)
+    API->>Q: Enqueue intake job
+    UI->>API: GET /agents/intake/status/{job_id} (pollJob)
+    Q->>Agents: Intake → next_question / ready_to_generate + document_id
+
+    UI->>API: GET /generated-documents/{document_id}
+    API-->>UI: generated_docxjs_code → iframe RENDER_DOC
+
+    UI->>API: POST /agents/document-edit/ (document_id, instruction, files)
+    UI->>API: GET /agents/document-edit/status/{job_id} (pollJob)
+    UI->>API: PUT /generated-documents/{document_id} (Accept) / DELETE (Reject)
+```
+
+**Key client modules:**
+
+```
+opandz_frontend/src/
+├── app/page.tsx            # Workspace entry — auth gate + vault/intake/document views
+├── contexts/AuthContext.tsx # Firebase session, Google/email sign-in, token refresh, mock mode
+├── lib/api.ts              # Typed backend contract (setup/intake/edit/registry/documents) + pollJob
+├── lib/firebase.ts         # Firebase singleton (auth + analytics, SSR-safe)
+└── public/sandbox.html     # Isolated DOCX render + download sandbox (postMessage bridge)
+```
+
+**Run locally:**
+
+```bash
+cd opandz_frontend
+npm install
+# point at backend
+echo "NEXT_PUBLIC_API_URL=http://localhost:8000" > .env.local
+npm run dev   # http://localhost:3000
+```
+
+---
+
 ## Infrastructure & Deployment
 
 ### Cloud Run Services
@@ -405,6 +502,16 @@ Opandz_legal_new/
 ├── requirements.txt                # Python dependencies
 ├── .env                            # Environment configuration
 │
+├── opandz_frontend/                # Next.js lawyer workspace (opandzai.web.app)
+│   ├── src/
+│   │   ├── app/page.tsx            #   Auth gate + vault / intake / document views
+│   │   ├── contexts/AuthContext.tsx #  Firebase auth session + token provider
+│   │   ├── lib/api.ts              #   Typed backend contract + pollJob helper
+│   │   └── lib/firebase.ts         #   Firebase singleton (SSR-safe)
+│   ├── public/sandbox.html         #   Isolated DOCX preview + download sandbox
+│   ├── firebase.json / .firebaserc #   Firebase Hosting config (site: opandzai)
+│   └── next.config.ts / package.json
+│
 ├── src/
 │   ├── api/                        # HTTP layer
 │   │   ├── setup_router.py         #   Template setup endpoints
@@ -490,4 +597,4 @@ Opandz_legal_new/
 
 ---
 
-**Built with** LangGraph | FastAPI | Gemini | Firebase | Cloud Run
+**Built with** Next.js | LangGraph | FastAPI | Gemini | Firebase | Cloud Run
